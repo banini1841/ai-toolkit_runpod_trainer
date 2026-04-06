@@ -11,6 +11,7 @@ import glob
 import threading
 import hashlib
 import yaml
+import base64
 
 
 print_lock = threading.Lock()
@@ -71,6 +72,9 @@ REMOTE_CONFIG_DIR = f"{REMOTE_TOOLKIT_DIR}/config"
 REMOTE_OUTPUT_DIR = f"{REMOTE_TOOLKIT_DIR}/output"
 
 LOG_FILE = f"{REMOTE_WORKSPACE_DIR}/training_run.log"
+REMOTE_PID_FILE = f"{REMOTE_WORKSPACE_DIR}/train.pid"
+REMOTE_EXIT_FILE = f"{REMOTE_WORKSPACE_DIR}/train_exit"
+REMOTE_TRAIN_SCRIPT = f"{REMOTE_WORKSPACE_DIR}/run_train.sh"
 
 # Check existence of local config files
 config_1_exists = os.path.isfile(LOCAL_CONFIG1_PATH)
@@ -311,6 +315,166 @@ def sha256_of_local_file(local_file):
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def run_remote_command_output(remote_cmd):
+    """Runs a command remotely via SSH and returns (returncode, stdout).
+    Does not raise on failure - returns (-1, '') instead."""
+    if not POD_IP_OR_HOSTNAME or not POD_PORT:
+        return -1, ""
+    user_host = f"{POD_USER}@{POD_IP_OR_HOSTNAME}"
+    cmd_str = f"{SSH_EXE_PATH} {_ssh_base_args()} {shlex.quote(user_host)} {shlex.quote(remote_cmd)}"
+    try:
+        result = subprocess.run(
+            cmd_str, shell=True, capture_output=True, text=True,
+            encoding='utf-8', errors='replace', timeout=30
+        )
+        return result.returncode, (result.stdout.strip() if result.stdout else "")
+    except Exception:
+        return -1, ""
+
+
+def try_ssh_connection():
+    """Test if SSH connection to the pod works."""
+    rc, output = run_remote_command_output("echo ok")
+    return rc == 0 and "ok" in output
+
+
+def handle_disconnection():
+    """Handle SSH disconnection: reconnect in background while prompting user.
+    Returns True if reconnected, False if user chose to terminate."""
+    reconnected = threading.Event()
+    user_terminate = threading.Event()
+
+    def reconnect_worker():
+        attempt = 0
+        while not user_terminate.is_set():
+            attempt += 1
+            safe_print(f"[Reconnect] Attempt {attempt}...")
+            if try_ssh_connection():
+                reconnected.set()
+                return
+            user_terminate.wait(20)
+
+    def input_worker():
+        while not reconnected.is_set() and not user_terminate.is_set():
+            try:
+                answer = input(f"\nConnection lost. Terminate pod {POD_ID}? (y/n): ").lower().strip()
+                if answer == 'y':
+                    user_terminate.set()
+                    return
+                elif answer == 'n':
+                    safe_print("Continuing reconnection attempts...")
+            except EOFError:
+                user_terminate.set()
+                return
+
+    reconnect_t = threading.Thread(target=reconnect_worker, daemon=True)
+    input_t = threading.Thread(target=input_worker, daemon=True)
+    reconnect_t.start()
+    input_t.start()
+
+    while not reconnected.is_set() and not user_terminate.is_set():
+        time.sleep(0.5)
+
+    if reconnected.is_set():
+        safe_print("\n--- Connection re-established! Resuming... ---")
+        return True
+    return False
+
+
+def launch_training_nohup(config_file, stage_label):
+    """Write a training wrapper script to the pod and launch it with nohup.
+    Training survives SSH disconnects. Returns the remote PID."""
+    safe_print(f"\n--- Launching {stage_label} with nohup ---")
+
+    # Clean previous state
+    run_remote_command(f"rm -f {REMOTE_EXIT_FILE} {REMOTE_PID_FILE} {REMOTE_TRAIN_SCRIPT}", check=False)
+
+    # Create wrapper script via base64 to avoid shell quoting issues
+    script_content = (
+        f"#!/bin/bash\n"
+        f"cd {REMOTE_TOOLKIT_DIR}\n"
+        f"./venv/bin/python run.py {config_file} >> {LOG_FILE} 2>&1\n"
+        f"echo $? > {REMOTE_EXIT_FILE}\n"
+    )
+    encoded = base64.b64encode(script_content.encode()).decode()
+    run_remote_command(
+        f"echo {encoded} | base64 -d > {REMOTE_TRAIN_SCRIPT} && chmod +x {REMOTE_TRAIN_SCRIPT}",
+        check=True
+    )
+
+    # Launch with nohup and save PID
+    run_remote_command(
+        f"nohup {REMOTE_TRAIN_SCRIPT} > /dev/null 2>&1 & echo $! > {REMOTE_PID_FILE}",
+        check=True
+    )
+
+    # Read back the PID
+    rc, pid = run_remote_command_output(f"cat {REMOTE_PID_FILE}")
+    if rc != 0 or not pid.strip().isdigit():
+        raise RuntimeError(f"Failed to get training PID. rc={rc}, output='{pid}'")
+
+    pid = pid.strip()
+    safe_print(f"Training process launched with PID {pid}")
+    return pid
+
+
+def monitor_training(stage_label, poll_interval=15):
+    """Monitor a nohup training process, handling SSH disconnects gracefully.
+    Returns the exit code of the training process (0 = success)."""
+    global sync_thread, sync_stop_event
+
+    while True:
+        try:
+            check_cmd = (
+                f"if [ -f {REMOTE_EXIT_FILE} ]; then "
+                f"echo DONE $(cat {REMOTE_EXIT_FILE}); "
+                f"elif [ -f {REMOTE_PID_FILE} ] && kill -0 $(cat {REMOTE_PID_FILE}) 2>/dev/null; then "
+                f"echo RUNNING; "
+                f"else echo ERROR; fi"
+            )
+            rc, output = run_remote_command_output(check_cmd)
+
+            if rc != 0:
+                raise ConnectionError(f"SSH command failed (rc={rc})")
+
+            if output.startswith("DONE"):
+                parts = output.split()
+                exit_code = int(parts[1]) if len(parts) > 1 else -1
+                safe_print(f"{stage_label} finished with exit code {exit_code}")
+                return exit_code
+            elif output.startswith("RUNNING"):
+                pass  # still running, continue polling
+            elif output.startswith("ERROR"):
+                safe_print(f"WARNING: Training process not found and no exit file. It may have crashed.")
+                return -1
+            else:
+                safe_print(f"WARNING: Unexpected status output: {output}")
+
+            time.sleep(poll_interval)
+
+        except Exception as e:
+            safe_print(f"\n!!! SSH connection lost during {stage_label}: {e} !!!")
+
+            # Stop sync while disconnected
+            sync_stop_event.set()
+            if sync_thread and sync_thread.is_alive():
+                sync_thread.join(timeout=5)
+
+            if handle_disconnection():
+                # Reconnected - restart sync and monitoring
+                safe_print("Restarting continuous checkpoint sync...")
+                sync_stop_event = threading.Event()
+                sync_thread = threading.Thread(
+                    target=continuous_output_sync, args=(5,), daemon=True
+                )
+                sync_thread.start()
+                launch_monitoring_window()
+                safe_print(f"Resuming {stage_label} monitoring...")
+                continue
+            else:
+                raise RuntimeError(f"User chose to terminate during {stage_label} disconnection")
 
 
 def set_yaml_value(data, path, value):
@@ -615,17 +779,26 @@ try:
     sync_thread = threading.Thread(target=continuous_output_sync, args=(5,), daemon=True)
     sync_thread.start()
     run_remote_command(f"echo '--- Step 4: Running Training ---' >> {LOG_FILE} 2>&1", check=False)
-    train_cmd_1 = f"cd {REMOTE_TOOLKIT_DIR} && echo -e '\\n--- Starting Training Stage 1 ---\\n' >> {LOG_FILE} 2>&1 && ./venv/bin/python run.py {CONFIG_FILE_1} >> {LOG_FILE} 2>&1"
-    print(f"\n--- Running Stage 1 (Output appended to {LOG_FILE} on pod) ---")
-    run_remote_command(train_cmd_1, check=True)
 
+    # Stage 1 - launched with nohup so training survives SSH disconnects
+    run_remote_command(f"echo -e '\\n--- Starting Training Stage 1 ---\\n' >> {LOG_FILE} 2>&1", check=False)
+    print(f"\n--- Running Stage 1 (Output appended to {LOG_FILE} on pod) ---")
+    launch_training_nohup(CONFIG_FILE_1, "Training Stage 1")
+    exit_code = monitor_training("Training Stage 1")
+    if exit_code != 0:
+        raise RuntimeError(f"Training Stage 1 failed with exit code {exit_code}")
+
+    # Stage 2 (if applicable)
     if config_2_exists:
-        train_cmd_2 = f"cd {REMOTE_TOOLKIT_DIR} && echo -e '\\n--- Starting Training Stage 2 ---\\n' >> {LOG_FILE} 2>&1 && ./venv/bin/python run.py {CONFIG_FILE_2} >> {LOG_FILE} 2>&1"
+        run_remote_command(f"echo -e '\\n--- Starting Training Stage 2 ---\\n' >> {LOG_FILE} 2>&1", check=False)
         print(f"\n--- Running Stage 2 (Output appended to {LOG_FILE} on pod) ---")
-        run_remote_command(train_cmd_2, check=True)
+        launch_training_nohup(CONFIG_FILE_2, "Training Stage 2")
+        exit_code = monitor_training("Training Stage 2")
+        if exit_code != 0:
+            raise RuntimeError(f"Training Stage 2 failed with exit code {exit_code}")
 
     training_completed = True
-    # Stop checkpoint syncing (single stop, no duplicate)
+    # Stop checkpoint syncing
     sync_stop_event.set()
     if sync_thread:
         sync_thread.join()
