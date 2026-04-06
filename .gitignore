@@ -1,0 +1,26 @@
+# Virtual environments
+env/
+venv/
+.venv/
+
+# Sensitive files (fill these in locally, don't commit real tokens)
+# Uncomment the line below if you don't want to track atw.txt at all:
+# atw.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# SSH
+*.pem
+id_*
+!id_*.pub
+
+# Temporary
+*.tmp
+ssh_known_hosts

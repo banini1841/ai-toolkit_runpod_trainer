@@ -1,0 +1,14 @@
+CLOUD_TYPE: COMMUNITY
+GPU_TYPE_ID: NVIDIA A100 80GB PCIe
+CONTAINER_DISK_GB: 150
+
+name: your_lora_name
+trigger_word: your_trigger_word
+steps: 8400
+save_every: 420
+max_step_saves_to_keep: 6
+
+LOCAL_CONFIG1_PATH: D:\path\to\your\train_lora.yaml
+LOCAL_DATASET_DIR: D:\path\to\your\dataset
+LOCAL_DOWNLOAD_DIR: D:\path\to\your\output
+LOCAL_RESUME_SOURCE_DIR:
